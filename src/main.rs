@@ -30,7 +30,7 @@ async fn main() {
 
     loop {
         tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
-        println!("Running");
+        println!("✅ Running");
     }
 
 
@@ -54,7 +54,7 @@ async fn fetch_data(client: &Client, url: &str) -> Result<String, String> {
                         Err(e) => Err::<String, String>(format!("Error reading response: {}", e)),
                     },
                     StatusCode::TOO_MANY_REQUESTS => {
-                        println!("Too many requests, waiting 1 seconds");
+                        println!("📈 Too many requests, waiting 1 second 💤");
                         tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
                         continue;
                     }
@@ -90,7 +90,7 @@ async fn sync_block(start: u64, end: u64) {
                 write_atomically(&path_file, &compressed_data)
                     .await
                     .err();
-                println!("Fetched block {}", block_number);
+                println!("📦 Fetched block {}", block_number);
             }
             Err(e) => {
                 println!("Error: {}", e);
@@ -125,10 +125,10 @@ async fn sync_state_update(start: u64, end: u64) {
                 write_atomically(&path_file, &compressed_data)
                     .await
                     .err();
-                println!("Fetched state update block {}", block_number);
+                println!("🗳️  Fetched state update block {}", block_number);
             }
             Err(e) => {
-                println!("Error: {}", e);
+                println!("❌ Error: {}", e);
             }
         }
     }
@@ -187,8 +187,8 @@ async fn handle_request(req: Request<Body>) -> Result<Response<Body>, hyper::Err
             // Check if response is in cache
             if cache_path.exists() {
                 let cached_response =
-                    decompress(&fs::read(&cache_path).await.expect("Unable to read file"));
-                println!("Serving from cache, {}", request_type.path());
+                    decompress(&fs::read(&cache_path).await.expect("❌ Unable to read file"));
+                println!("📤 Serving from cache, {}", request_type.path());
                 return Ok(Response::new(Body::from(cached_response)));
             } else {
                 // Fetch from external API and store in cache
@@ -202,15 +202,15 @@ async fn handle_request(req: Request<Body>) -> Result<Response<Body>, hyper::Err
                     .get(&external_url)
                     .send()
                     .await
-                    .expect("Unable to fetch");
+                    .expect("❌ Unable to fetch");
 
                 let status = external_resp.status();
 
                 let external_resp_text =
-                    external_resp.text().await.expect("Unable to read response");
+                    external_resp.text().await.expect("❌ Unable to read response");
 
                 if status != 200 {
-                    println!("Error status from external API: {}", status);
+                    println!("❌ Error status from external API: {}", status);
                     return Ok(Response::new(Body::from(external_resp_text)));
                 }
 
@@ -218,13 +218,20 @@ async fn handle_request(req: Request<Body>) -> Result<Response<Body>, hyper::Err
                 write_atomically(&cache_path, external_resp_text.as_bytes())
                     .await
                     .err();
-
-                println!("Fetched block {} and stored in cache", block_number);
+                match request_type {
+                    RequestType::Block(block_number) => {
+                        println!("📦 Fetched block {} and stored in cache", block_number);
+                    }
+                    RequestType::StateUpdate(block_number) => {
+                        println!("🗳️  Fetched state update block {} and stored in cache", block_number);
+                    }
+                    _ => {}
+                }
                 Ok(Response::new(Body::from(external_resp_text)))
             }
         }
         RequestType::Other => {
-            println!("Invalid request type");
+            println!("🚫 Invalid request type");
             Ok(Response::new(Body::from("Invalid request type")))
         }
     }
@@ -259,14 +266,14 @@ async fn write_atomically(file_path: &PathBuf, data: &[u8]) -> io::Result<()> {
     match fs::write(&temp_file_path, data).await {
         Ok(_) => {}
         Err(e) => {
-            println!("Error writing to temp file {}: {}", temp_file_path.display(), e);
+            println!("❌ Error writing to temp file {}: {}", temp_file_path.display(), e);
             return Err(e);
         }
     }
     match fs::rename(&temp_file_path, file_path).await {
         Ok(_) => {}
         Err(e) => {
-            println!("Error renaming temp file {} : {}" , temp_file_path.display(), e);
+            println!("❌ Error renaming temp file {} : {}" , temp_file_path.display(), e);
             return Err(e);
         }
     }
