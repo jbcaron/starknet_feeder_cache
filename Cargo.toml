@@ -10,3 +10,4 @@ reqwest = { version = "0.11", features = ["blocking", "json"] }
 tokio = { version = "1", features = ["full"] }
 flate2 = { version = "1", features = ["zlib"] }
 hyper = { version = "0.14", features = ["full"] }
+anyhow = "1.0.79"
