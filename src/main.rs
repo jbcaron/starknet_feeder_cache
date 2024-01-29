@@ -4,11 +4,8 @@ use hyper::{
     Body, Request, Response, Server, StatusCode,
 };
 use reqwest::Client;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::{
-    clone,
-    sync::atomic::{AtomicBool, Ordering},
-};
 use std::{
     io::{Read, Write},
     path::PathBuf,
@@ -17,7 +14,7 @@ use tokio::{fs, io};
 
 static DB_PATH: &str = "../feeder_db";
 static FEEDER_GATEWAY_URL: &str = "https://alpha-mainnet.starknet.io/feeder_gateway";
-static MAX_BLOCK_TO_SYNC: u64 = 200_000;
+static MAX_BLOCK_TO_SYNC: u64 = 500_000;
 
 #[tokio::main]
 async fn main() {
@@ -49,17 +46,17 @@ async fn main() {
     });
 
     let mut set = tokio::task::JoinSet::new();
-    
-    let clone_running = running.clone();
-    set.spawn(sync_block(0, MAX_BLOCK_TO_SYNC, clone_running));
-    
-    let clone_running = running.clone();
-    set.spawn(sync_state_update(0, MAX_BLOCK_TO_SYNC, clone_running));
+
+    // let clone_running = running.clone();
+    // set.spawn(sync_block(0, MAX_BLOCK_TO_SYNC, clone_running));
+
+    // let clone_running = running.clone();
+    // set.spawn(sync_state_update(0, MAX_BLOCK_TO_SYNC, clone_running));
 
     let make_svc =
         make_service_fn(|_conn| async { Ok::<_, hyper::Error>(service_fn(handle_request)) });
 
-    let addr = ([127, 0, 0, 1], 3000).into();
+    let addr = ([0, 0, 0, 0], 3000).into();
 
     let clone_running = running.clone();
 
@@ -73,12 +70,8 @@ async fn main() {
 
     set.spawn(async move {
         match server.await {
-            Ok(_) => {
-                println!("🔴 Server stopped");
-            }
-            Err(e) => {
-                eprintln!("❌ Error running server: {}", e);
-            }
+            Ok(_) => format!("Server stopped"),
+            Err(e) => format!("server: {}", e),
         }
     });
 
@@ -86,15 +79,14 @@ async fn main() {
 
     while let Some(result) = set.join_next().await {
         match result {
-            Ok(_) => {
-                println!("🔴 Task stopped");
+            Ok(ret) => {
+                println!("🔴 Task stopped: {}", ret);
             }
             Err(e) => {
                 eprintln!("❌ Error: {}", e);
             }
         }
     }
-
 }
 
 async fn fetch_data(client: &Client, url: &str) -> anyhow::Result<String> {
@@ -131,14 +123,13 @@ async fn read_and_decompress(file_path: &PathBuf) -> io::Result<String> {
     Ok(decompressed_data)
 }
 
-async fn sync_block(start: u64, end: u64, running: Arc<AtomicBool>) {
+async fn sync_block(start: u64, end: u64, running: Arc<AtomicBool>) -> String {
     let client = Client::new();
 
     for block_number in start..=end {
         // Check if a graceful shutdown was requested
         if !running.load(Ordering::SeqCst) {
-            println!("block {} to {} done", start, block_number - 1);
-            return;
+            return format!("Synched block {} to {}", start, block_number - 1);
         }
         let path_file = PathBuf::from(format!(
             "{}/{}.gz",
@@ -154,33 +145,30 @@ async fn sync_block(start: u64, end: u64, running: Arc<AtomicBool>) {
             FEEDER_GATEWAY_URL, block_number
         );
         match fetch_data(&client, &url).await {
-            Ok(content) => {
-                match compress_and_write(&path_file, &content).await {
-                    Ok(_) => {
-                        println!("📦 Fetched block {}", block_number);
-                    }
-                    Err(e) => {
-                        eprintln!("❌ Error writing to file {}: {}", &path_file.display(), e);
-                        continue;
-                    }
+            Ok(content) => match compress_and_write(&path_file, &content).await {
+                Ok(_) => {
+                    println!("📦 Fetched block {}", block_number);
                 }
-            }
+                Err(e) => {
+                    eprintln!("❌ Error writing to file {}: {}", &path_file.display(), e);
+                    continue;
+                }
+            },
             Err(e) => {
                 eprintln!("❌ Error fetching block {}: {}", block_number, e);
             }
         }
     }
-    println!("block {} to {} done", start, end);
+    format!("Synched block {} to {}", start, end)
 }
 
-async fn sync_state_update(start: u64, end: u64, running: Arc<AtomicBool>) {
+async fn sync_state_update(start: u64, end: u64, running: Arc<AtomicBool>) -> String {
     let client = Client::new();
 
     for block_number in start..=end {
         // Check if a graceful shutdown was requested
         if !running.load(Ordering::SeqCst) {
-            println!("state update {} to {} done", start, block_number - 1);
-            return;
+            return format!("Synched state update {} to {}", start, block_number - 1);
         }
         let path_file = PathBuf::from(format!(
             "{}/{}.gz",
@@ -196,23 +184,24 @@ async fn sync_state_update(start: u64, end: u64, running: Arc<AtomicBool>) {
             FEEDER_GATEWAY_URL, block_number
         );
         match fetch_data(&client, &url).await {
-            Ok(content) => {
-                match compress_and_write(&path_file, &content).await {
-                    Ok(_) => {
-                        println!("🗳️  Fetched state update block {}", block_number);
-                    }
-                    Err(e) => {
-                        eprintln!("❌ Error writing to file {}: {}", &path_file.display(), e);
-                        continue;
-                    }
+            Ok(content) => match compress_and_write(&path_file, &content).await {
+                Ok(_) => {
+                    println!("🗳️  Fetched state update block {}", block_number);
                 }
-            }
+                Err(e) => {
+                    eprintln!("❌ Error writing to file {}: {}", &path_file.display(), e);
+                    continue;
+                }
+            },
             Err(e) => {
-                eprintln!("❌ Error fetching state update block {}: {}", block_number, e);
+                eprintln!(
+                    "❌ Error fetching state update block {}: {}",
+                    block_number, e
+                );
             }
         }
     }
-    println!("state update {} to {} done", start, end);
+    format!("Synched state update {} to {}", start, end)
 }
 
 enum RequestType {
@@ -252,14 +241,14 @@ async fn handle_request(req: Request<Body>) -> anyhow::Result<Response<Body>> {
     let uri = req.uri().to_string();
 
     // Check if URI is valid
-    let request_type = match uri {
-        uri if uri.starts_with("/feeder_gateway/get_block") => {
+    let request_type = match &uri {
+        uri if uri.starts_with("/feeder_gateway/get_block?blockNumber=") => {
             RequestType::Block(match block_number_from_path(&uri) {
                 Ok(block_number) => block_number,
                 Err(e) => return Ok(Response::new(Body::from(e))),
             })
         }
-        uri if uri.starts_with("/feeder_gateway/get_state_update") => {
+        uri if uri.starts_with("/feeder_gateway/get_state_update?blockNumber=") => {
             RequestType::StateUpdate(match block_number_from_path(&uri) {
                 Ok(block_number) => block_number,
                 Err(e) => return Ok(Response::new(Body::from(e))),
@@ -298,21 +287,41 @@ async fn handle_request(req: Request<Body>) -> anyhow::Result<Response<Body>> {
                                 return ret;
                             }
                             Err(e) => {
-                                eprintln!("❌ Error writing to file {}: {}", &cache_path.display(), e);
+                                eprintln!(
+                                    "❌ Error writing to file {}: {}",
+                                    &cache_path.display(),
+                                    e
+                                );
                                 return ret;
                             }
                         }
                     }
                     Err(e) => {
                         eprintln!("❌ Error fetching {}: {}", request_type.path(), e);
-                        return Ok(Response::new(Body::from("Error fetching from external API")));
+                        return Ok(Response::new(Body::from(
+                            "Error fetching from external API",
+                        )));
                     }
                 }
             }
         }
+        // unmatched uri
         RequestType::Other => {
-            println!("🚫 Invalid request type");
-            Ok(Response::new(Body::from("Invalid request type")))
+            println!("❓ Unmatched URI: {}", uri);
+            let client = reqwest::Client::new();
+            let external_url = format!("{}{}", FEEDER_GATEWAY_URL, uri);
+            match fetch_data(&client, &external_url).await {
+                Ok(content) => {
+                    println!("📤 Serving from external API, {}", uri);
+                    return Ok(Response::new(Body::from(content)));
+                }
+                Err(e) => {
+                    eprintln!("❌ Error fetching {}: {}", uri, e);
+                    return Ok(Response::new(Body::from(
+                        "Error fetching from external API",
+                    )));
+                }
+            }
         }
     }
 }
