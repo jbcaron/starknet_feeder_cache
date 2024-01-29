@@ -13,7 +13,7 @@ use std::{
 use tokio::{fs, io};
 
 static DB_PATH: &str = "../feeder_db";
-static FEEDER_GATEWAY_URL: &str = "https://alpha-mainnet.starknet.io/feeder_gateway";
+static FEEDER_GATEWAY_URL: &str = "https://alpha-mainnet.starknet.io";
 static MAX_BLOCK_TO_SYNC: u64 = 500_000;
 
 #[tokio::main]
@@ -142,7 +142,7 @@ async fn sync_block(start: u64, end: u64, running: Arc<AtomicBool>) -> String {
         }
 
         let url = format!(
-            "{}/get_block?blockNumber={}",
+            "{}/feeder_gateway/get_block?blockNumber={}",
             FEEDER_GATEWAY_URL, block_number
         );
         match fetch_data(&client, &url).await {
@@ -181,7 +181,7 @@ async fn sync_state_update(start: u64, end: u64, running: Arc<AtomicBool>) -> St
         }
 
         let url = format!(
-            "{}/get_state_update?blockNumber={}",
+            "{}/feeder_gateway/get_state_update?blockNumber={}",
             FEEDER_GATEWAY_URL, block_number
         );
         match fetch_data(&client, &url).await {
@@ -302,7 +302,11 @@ async fn handle_request(req: Request<Body>) -> anyhow::Result<Response<Body>> {
             } else {
                 // Fetch from external API and store in cache
                 let client = reqwest::Client::new();
-                let external_url = format!("{}/{}", FEEDER_GATEWAY_URL, request_type.uri());
+                let external_url = format!(
+                    "{}/feeder_gateway/{}",
+                    FEEDER_GATEWAY_URL,
+                    request_type.uri()
+                );
                 match fetch_data(&client, &external_url).await {
                     Ok(content) => {
                         let ret = Ok(Response::new(Body::from(content.clone())));
