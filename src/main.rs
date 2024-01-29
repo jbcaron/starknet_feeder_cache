@@ -244,16 +244,28 @@ async fn handle_request(req: Request<Body>) -> anyhow::Result<Response<Body>> {
     // Check if URI is valid
     let request_type = match &uri {
         uri if uri.starts_with("/feeder_gateway/get_block?blockNumber=") => {
-            RequestType::Block(match block_number_from_path(&uri) {
+            let block_number = match block_number_from_path(&uri) {
                 Ok(block_number) => block_number,
                 Err(e) => return Ok(Response::new(Body::from(e))),
-            })
+            };
+            match block_number {
+                block_number if block_number <= MAX_BLOCK_TO_SYNC => {
+                    RequestType::Block(block_number)
+                }
+                _ => RequestType::Other,
+            }
         }
         uri if uri.starts_with("/feeder_gateway/get_state_update?blockNumber=") => {
-            RequestType::StateUpdate(match block_number_from_path(&uri) {
+            let block_number = match block_number_from_path(&uri) {
                 Ok(block_number) => block_number,
                 Err(e) => return Ok(Response::new(Body::from(e))),
-            })
+            };
+            match block_number {
+                block_number if block_number <= MAX_BLOCK_TO_SYNC => {
+                    RequestType::StateUpdate(block_number)
+                }
+                _ => RequestType::Other,
+            }
         }
         _ => RequestType::Other,
     };
