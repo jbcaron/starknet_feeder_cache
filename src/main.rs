@@ -22,6 +22,7 @@ async fn main() {
         let path = PathBuf::from(DB_PATH);
         if path.is_file() {
             eprintln!("❌ {} is a file", &path.display());
+            return;
         } else if path.exists() == false {
             match fs::create_dir(&path).await {
                 Ok(_) => {
@@ -98,8 +99,8 @@ async fn fetch_data(client: &Client, url: &str) -> anyhow::Result<String> {
                 Err(e) => e,
             },
             StatusCode::TOO_MANY_REQUESTS => {
-                println!("📈 Too many requests, waiting 1 second 💤");
-                tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+                println!("📈 Too many requests, waiting 5 second 💤");
+                tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
                 continue;
             }
             e => return Err(anyhow::anyhow!("{}", e)),
@@ -271,6 +272,18 @@ async fn handle_request(req: Request<Body>) -> anyhow::Result<Response<Body>> {
                     }
                     Err(e) => {
                         eprintln!("❌ Error reading file {}: {}", &cache_path.display(), e);
+                        match fs::remove_file(&cache_path).await {
+                            Ok(_) => {
+                                println!("🗑️ Removed file {}", &cache_path.display());
+                            }
+                            Err(e) => {
+                                eprintln!(
+                                    "❌ Error removing file {}: {}",
+                                    &cache_path.display(),
+                                    e
+                                );
+                            }
+                        }
                         return Ok(Response::new(Body::from("Error from cache")));
                     }
                 }
