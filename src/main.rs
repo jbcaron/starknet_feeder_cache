@@ -138,7 +138,22 @@ async fn sync_block(start: u64, end: u64, running: Arc<AtomicBool>) -> String {
             RequestType::Block(block_number).path()
         ));
         if path_file.exists() {
-            continue;
+            match read_and_decompress(&path_file).await {
+                Ok(_) => {
+                    continue;
+                }
+                Err(e) => {
+                    eprintln!("❌ Error reading file {}: {}", &path_file.display(), e);
+                    match fs::remove_file(&path_file).await {
+                        Ok(_) => {
+                            println!("🗑️ Removed file {}", &path_file.display());
+                        }
+                        Err(e) => {
+                            eprintln!("❌ Error removing file {}: {}", &path_file.display(), e);
+                        }
+                    }
+                }
+            }
         }
 
         let url = format!(
@@ -177,7 +192,22 @@ async fn sync_state_update(start: u64, end: u64, running: Arc<AtomicBool>) -> St
             RequestType::StateUpdate(block_number).path()
         ));
         if path_file.exists() {
-            continue;
+            match read_and_decompress(&path_file).await {
+                Ok(_) => {
+                    continue;
+                }
+                Err(e) => {
+                    eprintln!("❌ Error reading file {}: {}", &path_file.display(), e);
+                    match fs::remove_file(&path_file).await {
+                        Ok(_) => {
+                            println!("🗑️ Removed file {}", &path_file.display());
+                        }
+                        Err(e) => {
+                            eprintln!("❌ Error removing file {}: {}", &path_file.display(), e);
+                        }
+                    }
+                }
+            }
         }
 
         let url = format!(
@@ -239,6 +269,7 @@ impl std::fmt::Display for RequestType {
 }
 
 async fn handle_request(req: Request<Body>) -> anyhow::Result<Response<Body>> {
+    let begin_time = std::time::Instant::now();
     let uri = req.uri().to_string();
 
     // Check if URI is valid
@@ -279,8 +310,10 @@ async fn handle_request(req: Request<Body>) -> anyhow::Result<Response<Body>> {
                 // Serve from cache
                 match read_and_decompress(&cache_path).await {
                     Ok(content) => {
-                        println!("📤 Serving from cache, {}", request_type.path());
-                        return Ok(Response::new(Body::from(content)));
+                        let ret = Response::new(Body::from(content.clone()));
+                        let elapsed_time = begin_time.elapsed();
+                        println!("📤 Serving from cache, {} ({} µs)", request_type.path(), elapsed_time.as_micros());
+                        return Ok(ret);
                     }
                     Err(e) => {
                         eprintln!("❌ Error reading file {}: {}", &cache_path.display(), e);
@@ -341,8 +374,10 @@ async fn handle_request(req: Request<Body>) -> anyhow::Result<Response<Body>> {
             let external_url = format!("{}{}", FEEDER_GATEWAY_URL, uri);
             match fetch_data(&client, &external_url).await {
                 Ok(content) => {
-                    println!("📤 Serving from external API, {}", uri);
-                    return Ok(Response::new(Body::from(content)));
+                    let ret = Response::new(Body::from(content));
+                    let elapsed_time = begin_time.elapsed();
+                    println!("📤 Serving from external API, {} ({} µs)", uri, elapsed_time.as_micros());
+                    return Ok(ret);
                 }
                 Err(e) => {
                     eprintln!("❌ Error fetching {}: {}", uri, e);
