@@ -280,9 +280,10 @@ async fn handle_request(req: Request<Body>) -> anyhow::Result<Response<Body>> {
                 // Serve from cache
                 match read_and_decompress(&cache_path).await {
                     Ok(content) => {
-                        let ret = Response::new(Body::from(content.clone()));
+                        let size = content.len();
+                        let ret = Response::new(Body::from(content));
                         let elapsed_time = begin_time.elapsed();
-                        println!("📤 Serving from cache, {} ({} µs)", request_type.path(), elapsed_time.as_micros());
+                        println!("📤 Serving from cache, {} ({} Ko, {} µs)", request_type.path(), size / 1024, elapsed_time.as_micros());
                         return Ok(ret);
                     }
                     Err(e) => {
@@ -312,9 +313,10 @@ async fn handle_request(req: Request<Body>) -> anyhow::Result<Response<Body>> {
                 );
                 match fetch_data(&client, &external_url).await {
                     Ok(content) => {
+                        let size = content.len();
                         let ret = Ok(Response::new(Body::from(content.clone())));
                         let elapsed_time = begin_time.elapsed();
-                        println!("📤 Serving from external API, {} ({} µs)", request_type.path(), elapsed_time.as_micros());
+                        println!("📤 Serving from external API, {} ({} Ko, {} µs)", request_type.path(), size / 1024, elapsed_time.as_micros());
                         match compress_and_write(&cache_path, &content).await {
                             Ok(_) => {
                                 println!("📦 Fetched {} and stored in cache", request_type);
@@ -346,9 +348,10 @@ async fn handle_request(req: Request<Body>) -> anyhow::Result<Response<Body>> {
             let external_url = format!("{}{}", FEEDER_GATEWAY_URL, uri);
             match fetch_data(&client, &external_url).await {
                 Ok(content) => {
+                    let size = content.len();
                     let ret = Response::new(Body::from(content));
                     let elapsed_time = begin_time.elapsed();
-                    println!("📤 Serving from external API, {} ({} µs)", uri, elapsed_time.as_micros());
+                    println!("📤 Serving from external API, {} ({} Ko, {} µs)", uri, size / 1024, elapsed_time.as_micros());
                     return Ok(ret);
                 }
                 Err(e) => {
