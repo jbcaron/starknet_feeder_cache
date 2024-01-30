@@ -138,22 +138,7 @@ async fn sync_block(start: u64, end: u64, running: Arc<AtomicBool>) -> String {
             RequestType::Block(block_number).path()
         ));
         if path_file.exists() {
-            match read_and_decompress(&path_file).await {
-                Ok(_) => {
-                    continue;
-                }
-                Err(e) => {
-                    eprintln!("❌ Error reading file {}: {}", &path_file.display(), e);
-                    match fs::remove_file(&path_file).await {
-                        Ok(_) => {
-                            println!("🗑️ Removed file {}", &path_file.display());
-                        }
-                        Err(e) => {
-                            eprintln!("❌ Error removing file {}: {}", &path_file.display(), e);
-                        }
-                    }
-                }
-            }
+            continue;
         }
 
         let url = format!(
@@ -192,22 +177,7 @@ async fn sync_state_update(start: u64, end: u64, running: Arc<AtomicBool>) -> St
             RequestType::StateUpdate(block_number).path()
         ));
         if path_file.exists() {
-            match read_and_decompress(&path_file).await {
-                Ok(_) => {
-                    continue;
-                }
-                Err(e) => {
-                    eprintln!("❌ Error reading file {}: {}", &path_file.display(), e);
-                    match fs::remove_file(&path_file).await {
-                        Ok(_) => {
-                            println!("🗑️ Removed file {}", &path_file.display());
-                        }
-                        Err(e) => {
-                            eprintln!("❌ Error removing file {}: {}", &path_file.display(), e);
-                        }
-                    }
-                }
-            }
+            continue;
         }
 
         let url = format!(
@@ -343,6 +313,8 @@ async fn handle_request(req: Request<Body>) -> anyhow::Result<Response<Body>> {
                 match fetch_data(&client, &external_url).await {
                     Ok(content) => {
                         let ret = Ok(Response::new(Body::from(content.clone())));
+                        let elapsed_time = begin_time.elapsed();
+                        println!("📤 Serving from external API, {} ({} µs)", request_type.path(), elapsed_time.as_micros());
                         match compress_and_write(&cache_path, &content).await {
                             Ok(_) => {
                                 println!("📦 Fetched {} and stored in cache", request_type);
