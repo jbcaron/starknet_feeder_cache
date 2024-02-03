@@ -5,6 +5,7 @@ use hyper::{
     Body, Request, Response, Server, StatusCode,
 };
 use reqwest::Client;
+use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::{
     io::{Read, Write},
@@ -58,8 +59,8 @@ async fn main() {
     // let clone_running = running.clone();
     // set.spawn(sync_state_update(0, MAX_BLOCK_TO_SYNC, clone_running));
 
-    //let clone_running = running.clone();
-    //set.spawn(sync_class(0, MAX_BLOCK_TO_SYNC, clone_running));
+    // let clone_running = running.clone();
+    // set.spawn(sync_class(0, MAX_BLOCK_TO_SYNC, clone_running));
 
     let make_svc =
         make_service_fn(|_conn| async { Ok::<_, hyper::Error>(service_fn(handle_request)) });
@@ -216,6 +217,27 @@ async fn sync_state_update(start: u64, end: u64, running: Arc<AtomicBool>) -> St
     format!("Synched state update {} to {}", start, end)
 }
 
+#[derive(Deserialize)]
+struct StateUpdate {
+    state_diff: StateDiff,
+}
+
+#[derive(Deserialize)]
+struct StateDiff {
+    deployed_contracts: Vec<Contract>,
+    declared_classes: Vec<Class>,
+}
+
+#[derive(Deserialize)]
+struct Contract {
+    class_hash: String,
+}
+
+#[derive(Deserialize)]
+struct Class {
+    class_hash: String,
+}
+
 async fn sync_class(start: u64, end: u64, running: Arc<AtomicBool>) -> String {
     let client = Client::new();
 
@@ -248,32 +270,15 @@ async fn sync_class(start: u64, end: u64, running: Arc<AtomicBool>) -> String {
             }
         };
 
-        let json_state_update: serde_json::Value = match serde_json::from_str(&state_update) {
+        let json_state_update: StateUpdate = match serde_json::from_str(&state_update) {
             Ok(json_state_update) => json_state_update,
             Err(e) => {
-                eprintln!("❌ Error parsing state update: {}", e);
+                eprintln!("❌ Error parsing JSON: {}", e);
                 continue;
             }
         };
 
-        let mut class_hashes = vec![];
-
-        if let Some(state_diff) = json_state_update.get("state_diff") {
-            if let Some(deployed_contracts) = state_diff.get("deployed_contracts") {
-                for contract in deployed_contracts.as_array().unwrap() {
-                    if let Some(class_hash) = contract.get("class_hash") {
-                        class_hashes.push(class_hash.as_str().unwrap());
-                    }
-                }
-            }
-            if let Some(declared_classes) = state_diff.get("declared_classes") {
-                for contract in declared_classes.as_array().unwrap() {
-                    if let Some(class_hash) = contract.get("class_hash") {
-                        class_hashes.push(class_hash.as_str().unwrap());
-                    }
-                }
-            }
-        }
+        let class_hashes = extract_class_hash(&json_state_update.state_diff);
 
         for hash in class_hashes {
             let path_file = PathBuf::from(format!("{}/class_{}.gz", DB_PATH, hash));
@@ -303,6 +308,18 @@ async fn sync_class(start: u64, end: u64, running: Arc<AtomicBool>) -> String {
     format!("Synched class from block {} to {}", start, end)
 }
 
+fn extract_class_hash(state_diff: &StateDiff) -> Vec<&String> {
+    let mut class_hashes = vec![];
+
+    state_diff.deployed_contracts.iter().for_each(|contract| {
+        class_hashes.push(&contract.class_hash);
+    });
+    state_diff.declared_classes.iter().for_each(|class| {
+        class_hashes.push(&class.class_hash);
+    });
+
+    class_hashes
+}
 enum RequestType {
     Block(u64),
     StateUpdate(u64),
