@@ -1,14 +1,18 @@
+use core::hash;
 use flate2::{read::GzDecoder, write::GzEncoder, Compression};
 use hyper::{
     service::{make_service_fn, service_fn},
     Body, Request, Response, Server, StatusCode,
 };
 use reqwest::Client;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::{
     io::{Read, Write},
     path::PathBuf,
+};
+use std::{
+    sync::atomic::{AtomicBool, Ordering},
+    vec,
 };
 use tokio::{fs, io};
 
@@ -54,10 +58,13 @@ async fn main() {
     // let clone_running = running.clone();
     // set.spawn(sync_state_update(0, MAX_BLOCK_TO_SYNC, clone_running));
 
+    //let clone_running = running.clone();
+    //set.spawn(sync_class(0, MAX_BLOCK_TO_SYNC, clone_running));
+
     let make_svc =
         make_service_fn(|_conn| async { Ok::<_, hyper::Error>(service_fn(handle_request)) });
 
-    let addr = ([0, 0, 0, 0], 3000).into();
+    let addr = ([127, 0, 0, 1], 3000).into();
 
     let clone_running = running.clone();
 
@@ -169,7 +176,11 @@ async fn sync_state_update(start: u64, end: u64, running: Arc<AtomicBool>) -> St
     for block_number in start..=end {
         // Check if a graceful shutdown was requested
         if !running.load(Ordering::SeqCst) {
-            return format!("Synched state update {} to {}", start, block_number - 1);
+            return format!(
+                "Synched state update from block {} to {}",
+                start,
+                block_number - 1
+            );
         }
         let path_file = PathBuf::from(format!(
             "{}/{}.gz",
@@ -203,6 +214,93 @@ async fn sync_state_update(start: u64, end: u64, running: Arc<AtomicBool>) -> St
         }
     }
     format!("Synched state update {} to {}", start, end)
+}
+
+async fn sync_class(start: u64, end: u64, running: Arc<AtomicBool>) -> String {
+    let client = Client::new();
+
+    for block_number in start..=end {
+        // Check if a graceful shutdown was requested
+        if !running.load(Ordering::SeqCst) {
+            return format!("Synched class from block {} to {}", start, block_number - 1);
+        }
+
+        let path_state_update = PathBuf::from(format!(
+            "{}/{}.gz",
+            DB_PATH,
+            RequestType::StateUpdate(block_number).path()
+        ));
+
+        // Check if state update was fetched, if not, skip
+        if path_state_update.exists() == false {
+            continue;
+        }
+
+        let state_update = match read_and_decompress(&path_state_update).await {
+            Ok(state_update) => state_update,
+            Err(e) => {
+                eprintln!(
+                    "❌ Error reading file {}: {}",
+                    &path_state_update.display(),
+                    e
+                );
+                continue;
+            }
+        };
+
+        let json_state_update: serde_json::Value = match serde_json::from_str(&state_update) {
+            Ok(json_state_update) => json_state_update,
+            Err(e) => {
+                eprintln!("❌ Error parsing state update: {}", e);
+                continue;
+            }
+        };
+
+        let mut class_hashes = vec![];
+
+        if let Some(state_diff) = json_state_update.get("state_diff") {
+            if let Some(deployed_contracts) = state_diff.get("deployed_contracts") {
+                for contract in deployed_contracts.as_array().unwrap() {
+                    if let Some(class_hash) = contract.get("class_hash") {
+                        class_hashes.push(class_hash.as_str().unwrap());
+                    }
+                }
+            }
+            if let Some(declared_classes) = state_diff.get("declared_classes") {
+                for contract in declared_classes.as_array().unwrap() {
+                    if let Some(class_hash) = contract.get("class_hash") {
+                        class_hashes.push(class_hash.as_str().unwrap());
+                    }
+                }
+            }
+        }
+
+        for hash in class_hashes {
+            let path_file = PathBuf::from(format!("{}/class_{}.gz", DB_PATH, hash));
+            if path_file.exists() {
+                continue;
+            }
+            let url = format!(
+                "{}/feeder_gateway/get_class_by_hash?classHash={}",
+                FEEDER_GATEWAY_URL, hash
+            );
+            match fetch_data(&client, &url).await {
+                Ok(content) => match compress_and_write(&path_file, &content).await {
+                    Ok(_) => {
+                        println!("📦 Fetched class {}", hash);
+                    }
+                    Err(e) => {
+                        eprintln!("❌ Error writing to file {}: {}", &path_file.display(), e);
+                    }
+                },
+                Err(e) => {
+                    eprintln!("❌ Error fetching class {}: {}", hash, e);
+                }
+            }
+        }
+    }
+
+    format!("Synched class from block {} to {}", start, end)
 }
 
 enum RequestType {
@@ -239,6 +337,7 @@ impl std::fmt::Display for RequestType {
 }
 
 async fn handle_request(req: Request<Body>) -> anyhow::Result<Response<Body>> {
+    tokio::time::sleep(tokio::time::Duration::from_millis(5000)).await;
     let begin_time = std::time::Instant::now();
     let uri = req.uri().to_string();
 
@@ -283,7 +382,12 @@ async fn handle_request(req: Request<Body>) -> anyhow::Result<Response<Body>> {
                         let size = content.len();
                         let ret = Response::new(Body::from(content));
                         let elapsed_time = begin_time.elapsed();
-                        println!("📤 Serving from cache, {} ({} Ko, {} µs)", request_type.path(), size / 1024, elapsed_time.as_micros());
+                        println!(
+                            "📤 Serving from cache, {} ({} Ko, {} µs)",
+                            request_type.path(),
+                            size / 1024,
+                            elapsed_time.as_micros()
+                        );
                         return Ok(ret);
                     }
                     Err(e) => {
@@ -316,7 +420,12 @@ async fn handle_request(req: Request<Body>) -> anyhow::Result<Response<Body>> {
                         let size = content.len();
                         let ret = Ok(Response::new(Body::from(content.clone())));
                         let elapsed_time = begin_time.elapsed();
-                        println!("📤 Serving from external API, {} ({} Ko, {} µs)", request_type.path(), size / 1024, elapsed_time.as_micros());
+                        println!(
+                            "📤 Serving from external API, {} ({} Ko, {} µs)",
+                            request_type.path(),
+                            size / 1024,
+                            elapsed_time.as_micros()
+                        );
                         match compress_and_write(&cache_path, &content).await {
                             Ok(_) => {
                                 println!("📦 Fetched {} and stored in cache", request_type);
@@ -351,7 +460,12 @@ async fn handle_request(req: Request<Body>) -> anyhow::Result<Response<Body>> {
                     let size = content.len();
                     let ret = Response::new(Body::from(content));
                     let elapsed_time = begin_time.elapsed();
-                    println!("📤 Serving from external API, {} ({} Ko, {} µs)", uri, size / 1024, elapsed_time.as_micros());
+                    println!(
+                        "📤 Serving from external API, {} ({} Ko, {} µs)",
+                        uri,
+                        size / 1024,
+                        elapsed_time.as_micros()
+                    );
                     return Ok(ret);
                 }
                 Err(e) => {
