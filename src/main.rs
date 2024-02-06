@@ -2,6 +2,7 @@ use hyper::{
     service::{make_service_fn, service_fn},
     Body, Request, Response, Server, StatusCode,
 };
+use url::Url;
 use reqwest::Client;
 use serde::Deserialize;
 use std::fs;
@@ -17,7 +18,7 @@ use storage::{compress_and_write, read_and_decompress};
 
 static DB_PATH: &str = "../feeder_db";
 static FEEDER_GATEWAY_URL: &str = "https://alpha-mainnet.starknet.io";
-static MAX_BLOCK_TO_SYNC: u64 = 534_000;
+static MAX_BLOCK_TO_SYNC: u64 = 50;
 
 #[tokio::main]
 async fn main() {
@@ -349,7 +350,7 @@ impl RequestType {
                 }
             }
             uri if uri.starts_with("/feeder_gateway/get_class_by_hash?classHash=") => {
-                let class_hash = hash_from_path(&uri)?;
+                let class_hash = class_hash_from_path(&uri)?;
                 Ok(RequestType::Class(class_hash))
             }
             _ => Ok(RequestType::Other(uri.to_string())),
@@ -492,18 +493,28 @@ async fn handle_request(req: Request<Body>) -> anyhow::Result<Response<Body>> {
 }
 
 fn block_number_from_path(path: &str) -> Result<u64, &'static str> {
-    match path.split("=").last() {
-        Some(block_number) => match block_number.parse() {
-            Ok(block_number) => Ok(block_number),
-            Err(_) => return Err("Invalid block number"),
-        },
-        None => return Err("Invalid block number"),
-    }
+    match Url::parse(format!("http://localhost:3000/{}" ,path).as_str()) {
+        Ok(url) => for (key, value) in url.query_pairs() {
+            if key == "blockNumber" {
+                match value.parse() {
+                    Ok(block_number) => return Ok(block_number),
+                    Err(_) => return Err("Invalid block number"),
+                }
+            }
+        }
+        Err(_) => return Err("Invalid URL"),
+    };
+    Err("Invalid block number")
 }
 
-fn hash_from_path(path: &str) -> Result<String, &'static str> {
-    match path.split("=").last() {
-        Some(hash) => Ok(String::from(hash)),
-        None => Err("Invalid hash"),
-    }
+fn class_hash_from_path(path: &str) -> Result<String, &'static str> {
+    match Url::parse(format!("http://localhost:3000/{}" ,path).as_str()) {
+        Ok(url) => for (key, value) in url.query_pairs() {
+            if key == "classHash" {
+                return Ok(value.to_string());
+            }
+        }
+        Err(_) => return Err("Invalid URL"),
+    };
+    Err("Invalid class hash")
 }
