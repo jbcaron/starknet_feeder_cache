@@ -1,25 +1,23 @@
-use core::hash;
-use flate2::{read::GzDecoder, write::GzEncoder, Compression};
 use hyper::{
     service::{make_service_fn, service_fn},
     Body, Request, Response, Server, StatusCode,
 };
 use reqwest::Client;
-use serde::{Deserialize, Serialize};
-use std::sync::Arc;
-use std::{
-    io::{Read, Write},
-    path::PathBuf,
-};
+use serde::Deserialize;
+use std::fs;
+use std::path::PathBuf;
+use std::{f32::consts::E, sync::Arc};
 use std::{
     sync::atomic::{AtomicBool, Ordering},
     vec,
 };
-use tokio::{fs, io};
+
+mod storage;
+use storage::{compress_and_write, read_and_decompress};
 
 static DB_PATH: &str = "../feeder_db";
 static FEEDER_GATEWAY_URL: &str = "https://alpha-mainnet.starknet.io";
-static MAX_BLOCK_TO_SYNC: u64 = 500_000;
+static MAX_BLOCK_TO_SYNC: u64 = 534_000;
 
 #[tokio::main]
 async fn main() {
@@ -29,7 +27,7 @@ async fn main() {
             eprintln!("❌ {} is a file", &path.display());
             return;
         } else if path.exists() == false {
-            match fs::create_dir(&path).await {
+            match fs::create_dir(&path) {
                 Ok(_) => {
                     println!("✅ Created directory {}", &path.display());
                 }
@@ -53,14 +51,14 @@ async fn main() {
 
     let mut set = tokio::task::JoinSet::new();
 
-    // let clone_running = running.clone();
-    // set.spawn(sync_block(0, MAX_BLOCK_TO_SYNC, clone_running));
+    let clone_running = running.clone();
+    set.spawn(sync_block(0, MAX_BLOCK_TO_SYNC, clone_running));
 
-    // let clone_running = running.clone();
-    // set.spawn(sync_state_update(0, MAX_BLOCK_TO_SYNC, clone_running));
+    let clone_running = running.clone();
+    set.spawn(sync_state_update(0, MAX_BLOCK_TO_SYNC, clone_running));
 
-    // let clone_running = running.clone();
-    // set.spawn(sync_class(0, MAX_BLOCK_TO_SYNC, clone_running));
+    let clone_running = running.clone();
+    set.spawn(sync_class(0, MAX_BLOCK_TO_SYNC, clone_running));
 
     let make_svc =
         make_service_fn(|_conn| async { Ok::<_, hyper::Error>(service_fn(handle_request)) });
@@ -107,7 +105,7 @@ async fn fetch_data(client: &Client, url: &str) -> anyhow::Result<String> {
                 Err(e) => e,
             },
             StatusCode::TOO_MANY_REQUESTS => {
-                println!("📈 Too many requests, waiting 5 second 💤");
+                println!("📈 Too many requests, waiting 5 seconds 💤");
                 tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
                 continue;
             }
@@ -116,28 +114,12 @@ async fn fetch_data(client: &Client, url: &str) -> anyhow::Result<String> {
     }
 }
 
-async fn compress_and_write(file_path: &PathBuf, data: &str) -> io::Result<()> {
-    let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
-    encoder.write_all(data.as_bytes())?;
-    let compressed_data = encoder.finish()?;
-    write_atomically(file_path, &compressed_data).await?;
-    Ok(())
-}
-
-async fn read_and_decompress(file_path: &PathBuf) -> io::Result<String> {
-    let compressed_data = fs::read(&file_path).await?;
-    let mut decoder = GzDecoder::new(&compressed_data[..]);
-    let mut decompressed_data = String::new();
-    decoder.read_to_string(&mut decompressed_data)?;
-    Ok(decompressed_data)
-}
-
 async fn sync_block(start: u64, end: u64, running: Arc<AtomicBool>) -> String {
     let client = Client::new();
 
     for block_number in start..=end {
         // Check if a graceful shutdown was requested
-        if !running.load(Ordering::SeqCst) {
+        if running.load(Ordering::SeqCst) == false {
             return format!("Synched block {} to {}", start, block_number - 1);
         }
         let path_file = PathBuf::from(format!(
@@ -154,7 +136,7 @@ async fn sync_block(start: u64, end: u64, running: Arc<AtomicBool>) -> String {
             FEEDER_GATEWAY_URL, block_number
         );
         match fetch_data(&client, &url).await {
-            Ok(content) => match compress_and_write(&path_file, &content).await {
+            Ok(content) => match compress_and_write(&path_file, &content) {
                 Ok(_) => {
                     println!("📦 Fetched block {}", block_number);
                 }
@@ -176,7 +158,7 @@ async fn sync_state_update(start: u64, end: u64, running: Arc<AtomicBool>) -> St
 
     for block_number in start..=end {
         // Check if a graceful shutdown was requested
-        if !running.load(Ordering::SeqCst) {
+        if running.load(Ordering::SeqCst) == false {
             return format!(
                 "Synched state update from block {} to {}",
                 start,
@@ -197,7 +179,7 @@ async fn sync_state_update(start: u64, end: u64, running: Arc<AtomicBool>) -> St
             FEEDER_GATEWAY_URL, block_number
         );
         match fetch_data(&client, &url).await {
-            Ok(content) => match compress_and_write(&path_file, &content).await {
+            Ok(content) => match compress_and_write(&path_file, &content) {
                 Ok(_) => {
                     println!("🗳️  Fetched state update block {}", block_number);
                 }
@@ -258,7 +240,7 @@ async fn sync_class(start: u64, end: u64, running: Arc<AtomicBool>) -> String {
             continue;
         }
 
-        let state_update = match read_and_decompress(&path_state_update).await {
+        let state_update = match read_and_decompress(&path_state_update) {
             Ok(state_update) => state_update,
             Err(e) => {
                 eprintln!(
@@ -290,7 +272,7 @@ async fn sync_class(start: u64, end: u64, running: Arc<AtomicBool>) -> String {
                 FEEDER_GATEWAY_URL, hash
             );
             match fetch_data(&client, &url).await {
-                Ok(content) => match compress_and_write(&path_file, &content).await {
+                Ok(content) => match compress_and_write(&path_file, &content) {
                     Ok(_) => {
                         println!("📦 Fetched class {}", hash);
                     }
@@ -323,7 +305,8 @@ fn extract_class_hash(state_diff: &StateDiff) -> Vec<&String> {
 enum RequestType {
     Block(u64),
     StateUpdate(u64),
-    Other,
+    Class(String),
+    Other(String),
 }
 
 impl RequestType {
@@ -331,14 +314,45 @@ impl RequestType {
         match self {
             RequestType::Block(id) => format!("block_{}", id),
             RequestType::StateUpdate(id) => format!("state_update_{}", id),
-            RequestType::Other => String::from(""),
+            RequestType::Class(hash) => format!("class_{}", hash),
+            RequestType::Other(uri) => uri.to_string(),
         }
     }
+
     fn uri(&self) -> String {
         match self {
             RequestType::Block(id) => format!("get_block?blockNumber={}", id),
             RequestType::StateUpdate(id) => format!("get_state_update?blockNumber={}", id),
-            RequestType::Other => String::from(""),
+            RequestType::Class(hash) => format!("get_class_by_hash?classHash={}", hash),
+            RequestType::Other(uri) => uri.to_string(),
+        }
+    }
+
+    fn from_uri(uri: &str) -> Result<RequestType, &'static str> {
+        match uri {
+            uri if uri.starts_with("/feeder_gateway/get_block?blockNumber=") => {
+                let block_number = block_number_from_path(&uri)?;
+                match block_number {
+                    block_number if block_number <= MAX_BLOCK_TO_SYNC => {
+                        Ok(RequestType::Block(block_number))
+                    }
+                    _ => Ok(RequestType::Other(uri.to_string())),
+                }
+            }
+            uri if uri.starts_with("/feeder_gateway/get_state_update?blockNumber=") => {
+                let block_number = block_number_from_path(&uri)?;
+                match block_number {
+                    block_number if block_number <= MAX_BLOCK_TO_SYNC => {
+                        Ok(RequestType::StateUpdate(block_number))
+                    }
+                    _ => Ok(RequestType::Other(uri.to_string())),
+                }
+            }
+            uri if uri.starts_with("/feeder_gateway/get_class_by_hash?classHash=") => {
+                let class_hash = hash_from_path(&uri)?;
+                Ok(RequestType::Class(class_hash))
+            }
+            _ => Ok(RequestType::Other(uri.to_string())),
         }
     }
 }
@@ -348,7 +362,8 @@ impl std::fmt::Display for RequestType {
         match self {
             RequestType::Block(id) => write!(f, "block {}", id),
             RequestType::StateUpdate(id) => write!(f, "state update {}", id),
-            RequestType::Other => write!(f, "other"),
+            RequestType::Class(hash) => write!(f, "class {}", hash),
+            RequestType::Other(uri) => write!(f, "other: {}", uri),
         }
     }
 }
@@ -359,49 +374,29 @@ async fn handle_request(req: Request<Body>) -> anyhow::Result<Response<Body>> {
     let uri = req.uri().to_string();
 
     // Check if URI is valid
-    let request_type = match &uri {
-        uri if uri.starts_with("/feeder_gateway/get_block?blockNumber=") => {
-            let block_number = match block_number_from_path(&uri) {
-                Ok(block_number) => block_number,
-                Err(e) => return Ok(Response::new(Body::from(e))),
-            };
-            match block_number {
-                block_number if block_number <= MAX_BLOCK_TO_SYNC => {
-                    RequestType::Block(block_number)
-                }
-                _ => RequestType::Other,
-            }
+    let request_type = match RequestType::from_uri(&uri) {
+        Ok(request_type) => request_type,
+        Err(e) => {
+            eprintln!("❌ Error parsing URI: {}", e);
+            return Ok(Response::new(Body::from("Error parsing URI")));
         }
-        uri if uri.starts_with("/feeder_gateway/get_state_update?blockNumber=") => {
-            let block_number = match block_number_from_path(&uri) {
-                Ok(block_number) => block_number,
-                Err(e) => return Ok(Response::new(Body::from(e))),
-            };
-            match block_number {
-                block_number if block_number <= MAX_BLOCK_TO_SYNC => {
-                    RequestType::StateUpdate(block_number)
-                }
-                _ => RequestType::Other,
-            }
-        }
-        _ => RequestType::Other,
     };
 
     match request_type {
-        RequestType::Block(_) | RequestType::StateUpdate(_) => {
+        RequestType::Block(_) | RequestType::StateUpdate(_) | RequestType::Class(_) => {
             let cache_path = PathBuf::from(format!("{}/{}.gz", DB_PATH, request_type.path()));
 
             // Check if response is in cache
             if cache_path.exists() {
                 // Serve from cache
-                match read_and_decompress(&cache_path).await {
+                match read_and_decompress(&cache_path) {
                     Ok(content) => {
                         let size = content.len();
                         let ret = Response::new(Body::from(content));
                         let elapsed_time = begin_time.elapsed();
                         println!(
                             "📤 Serving from cache, {} ({} Ko, {} µs)",
-                            request_type.path(),
+                            request_type,
                             size / 1024,
                             elapsed_time.as_micros()
                         );
@@ -409,7 +404,7 @@ async fn handle_request(req: Request<Body>) -> anyhow::Result<Response<Body>> {
                     }
                     Err(e) => {
                         eprintln!("❌ Error reading file {}: {}", &cache_path.display(), e);
-                        match fs::remove_file(&cache_path).await {
+                        match fs::remove_file(&cache_path) {
                             Ok(_) => {
                                 println!("🗑️ Removed file {}", &cache_path.display());
                             }
@@ -439,11 +434,11 @@ async fn handle_request(req: Request<Body>) -> anyhow::Result<Response<Body>> {
                         let elapsed_time = begin_time.elapsed();
                         println!(
                             "📤 Serving from external API, {} ({} Ko, {} µs)",
-                            request_type.path(),
+                            request_type,
                             size / 1024,
                             elapsed_time.as_micros()
                         );
-                        match compress_and_write(&cache_path, &content).await {
+                        match compress_and_write(&cache_path, &content) {
                             Ok(_) => {
                                 println!("📦 Fetched {} and stored in cache", request_type);
                                 return ret;
@@ -468,7 +463,7 @@ async fn handle_request(req: Request<Body>) -> anyhow::Result<Response<Body>> {
             }
         }
         // unmatched uri
-        RequestType::Other => {
+        RequestType::Other(uri) => {
             println!("❓ Unmatched URI: {}", uri);
             let client = reqwest::Client::new();
             let external_url = format!("{}{}", FEEDER_GATEWAY_URL, uri);
@@ -496,19 +491,6 @@ async fn handle_request(req: Request<Body>) -> anyhow::Result<Response<Body>> {
     }
 }
 
-fn compress(data: &str) -> io::Result<Vec<u8>> {
-    let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
-    encoder.write_all(data.as_bytes())?;
-    Ok(encoder.finish()?)
-}
-
-fn decompress(data: &[u8]) -> io::Result<Vec<u8>> {
-    let mut decoder = GzDecoder::new(data);
-    let mut decompressed_data = Vec::new();
-    decoder.read_to_end(&mut decompressed_data)?;
-    Ok(decompressed_data)
-}
-
 fn block_number_from_path(path: &str) -> Result<u64, &'static str> {
     match path.split("=").last() {
         Some(block_number) => match block_number.parse() {
@@ -519,10 +501,9 @@ fn block_number_from_path(path: &str) -> Result<u64, &'static str> {
     }
 }
 
-async fn write_atomically(file_path: &PathBuf, data: &[u8]) -> io::Result<()> {
-    let temp_file_path = file_path.with_extension("tmp");
-
-    fs::write(&temp_file_path, data).await?;
-    fs::rename(&temp_file_path, file_path).await?;
-    Ok(())
+fn hash_from_path(path: &str) -> Result<String, &'static str> {
+    match path.split("=").last() {
+        Some(hash) => Ok(String::from(hash)),
+        None => Err("Invalid hash"),
+    }
 }
