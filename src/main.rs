@@ -1,97 +1,127 @@
-use hyper::{
-    service::{make_service_fn, service_fn},
-    Body, Request, Response, Server, StatusCode,
-};
-use url::Url;
-use reqwest::Client;
+use actix_web::middleware::Logger;
+use reqwest::{Client, StatusCode};
 use serde::Deserialize;
-use std::fs;
 use std::path::PathBuf;
-use std::{f32::consts::E, sync::Arc};
-use std::{
-    sync::atomic::{AtomicBool, Ordering},
-    vec,
-};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
+use actix_web::{web, App, HttpResponse, HttpServer, Responder};
+
+mod class_extract;
+mod config;
+mod primitives;
 mod storage;
-use storage::{compress_and_write, read_and_decompress};
 
-static DB_PATH: &str = "../feeder_db";
-static FEEDER_GATEWAY_URL: &str = "https://alpha-mainnet.starknet.io";
-static MAX_BLOCK_TO_SYNC: u64 = 50;
+use crate::primitives::{Block, Class, State};
+use class_extract::extract_class_hash;
+use storage::{is_key_present, read_data, write_data, Storage};
 
-#[tokio::main]
+#[actix_web::main]
 async fn main() {
-    {
-        let path = PathBuf::from(DB_PATH);
-        if path.is_file() {
-            eprintln!("❌ {} is a file", &path.display());
-            return;
-        } else if path.exists() == false {
-            match fs::create_dir(&path) {
-                Ok(_) => {
-                    println!("✅ Created directory {}", &path.display());
-                }
-                Err(e) => {
-                    eprintln!("❌ Error creating directory {}: {}", &path.display(), e);
-                    return;
-                }
-            }
-        }
-    }
+    env_logger::init();
+    let config = config::Config::new();
 
-    let running = Arc::new(AtomicBool::new(true));
-    let clone_running = running.clone();
-    // Handle SIGINT and change running to false when received
+    let storage = match Storage::new(&PathBuf::from(config.db_path)) {
+        Ok(storage) => Arc::new(storage),
+        Err(e) => {
+            log::error!("❌ Error initializing storage: {}", e);
+            return;
+        }
+    };
+
+    log::info!("💾 Storage initialized");
+    if let Some(max_block_sync) = storage.max_block_sync() {
+        log::info!("📦 Max block to sync: {}", max_block_sync);
+    }
+    if let Some(max_state_sync) = storage.max_state_sync() {
+        log::info!("📦 Max state to sync: {}", max_state_sync);
+    }
+    log::info!("🔗 Feeder gateway URL: {}", config.feeder_gateway_url);
+
+    let run = Arc::new(AtomicBool::new(true));
+    let run_clone = run.clone();
+
+    // Handle SIGINT and change run to false when received
     tokio::spawn(async move {
         tokio::signal::ctrl_c()
             .await
             .expect("Failed to listen for SIGINT");
-        clone_running.store(false, Ordering::SeqCst);
+        run_clone.store(false, Ordering::SeqCst);
     });
 
     let mut set = tokio::task::JoinSet::new();
 
-    let clone_running = running.clone();
-    set.spawn(sync_block(0, MAX_BLOCK_TO_SYNC, clone_running));
+    let run_clone = run.clone();
+    let storage_clone = storage.clone();
+    set.spawn(sync_block(
+        config.max_block_to_sync,
+        run_clone,
+        storage_clone,
+        config.feeder_gateway_url.clone(),
+    ));
 
-    let clone_running = running.clone();
-    set.spawn(sync_state_update(0, MAX_BLOCK_TO_SYNC, clone_running));
+    let run_clone = run.clone();
+    let storage_clone = storage.clone();
+    set.spawn(sync_state_update(
+        config.max_block_to_sync,
+        run_clone,
+        storage_clone,
+        config.feeder_gateway_url.clone(),
+    ));
 
-    let clone_running = running.clone();
-    set.spawn(sync_class(0, MAX_BLOCK_TO_SYNC, clone_running));
+    let run_clone = run.clone();
+    let storage_clone = storage.clone();
+    set.spawn(sync_class(
+        0,
+        config.max_block_to_sync,
+        run_clone,
+        storage_clone,
+        config.feeder_gateway_url.clone(),
+    ));
 
-    let make_svc =
-        make_service_fn(|_conn| async { Ok::<_, hyper::Error>(service_fn(handle_request)) });
+    let storage_clone = storage.clone();
+    let data = web::Data::new(storage_clone);
+    let server = HttpServer::new(move || {
+        App::new()
+            .app_data(web::Data::clone(&data))
+            .route("/feeder_gateway/get_block", web::get().to(get_block))
+            .route(
+                "/feeder_gateway/get_state_update",
+                web::get().to(get_state_update),
+            )
+            .route(
+                "/feeder_gateway/get_class_by_hash",
+                web::get().to(get_class_by_hash),
+            )
+            .wrap(Logger::default())
+            .route("/", web::get().to(index))
+    })
+    .bind(&config.server_addr)
+    .expect("Failed to bind server to address")
+    .run();
 
-    let addr = ([127, 0, 0, 1], 3000).into();
+    let server_handle = server.handle();
 
-    let clone_running = running.clone();
+    actix_web::rt::spawn(server);
 
-    let server = Server::bind(&addr)
-        .serve(make_svc)
-        .with_graceful_shutdown(async move {
-            while clone_running.load(Ordering::SeqCst) {
-                tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
-            }
-        });
+    log::info!("🟢 Server running on http://{}", &config.server_addr);
 
+    let run_clone = run.clone();
     set.spawn(async move {
-        match server.await {
-            Ok(_) => format!("Server stopped"),
-            Err(e) => format!("server: {}", e),
+        while run_clone.load(Ordering::SeqCst) {
+            tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
         }
+        server_handle.stop(false).await;
+        "server stop".to_string()
     });
-
-    println!("🟢 Server running on http://{}", addr);
 
     while let Some(result) = set.join_next().await {
         match result {
             Ok(ret) => {
-                println!("🔴 Task stopped: {}", ret);
+                log::info!("🔴 Task stopped: {}", ret);
             }
             Err(e) => {
-                eprintln!("❌ Error: {}", e);
+                log::error!("❌ Error: {}", e);
             }
         }
     }
@@ -106,7 +136,7 @@ async fn fetch_data(client: &Client, url: &str) -> anyhow::Result<String> {
                 Err(e) => e,
             },
             StatusCode::TOO_MANY_REQUESTS => {
-                println!("📈 Too many requests, waiting 5 seconds 💤");
+                log::info!("📈 Too many requests, waiting 5 seconds 💤");
                 tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
                 continue;
             }
@@ -115,174 +145,170 @@ async fn fetch_data(client: &Client, url: &str) -> anyhow::Result<String> {
     }
 }
 
-async fn sync_block(start: u64, end: u64, running: Arc<AtomicBool>) -> String {
+async fn sync_block(
+    end: u64,
+    running: Arc<AtomicBool>,
+    storage: Arc<Storage>,
+    feeder: String,
+) -> String {
     let client = Client::new();
 
-    for block_number in start..=end {
-        // Check if a graceful shutdown was requested
-        if running.load(Ordering::SeqCst) == false {
-            return format!("Synched block {} to {}", start, block_number - 1);
-        }
-        let path_file = PathBuf::from(format!(
-            "{}/{}.gz",
-            DB_PATH,
-            RequestType::Block(block_number).path()
-        ));
-        if path_file.exists() {
-            continue;
+    let start = match storage.max_block_sync() {
+        Some(block) => block.next(),
+        None => Block(0),
+    };
+
+    if start.0 > end {
+        return "No block to sync".to_string();
+    }
+
+    let mut block = start;
+    loop {
+        // Check if a graceful shutdown was requested or sync is finished
+        if !running.load(Ordering::SeqCst) || block.0 > end {
+            break;
         }
 
         let url = format!(
             "{}/feeder_gateway/get_block?blockNumber={}",
-            FEEDER_GATEWAY_URL, block_number
+            feeder, block.0
         );
         match fetch_data(&client, &url).await {
-            Ok(content) => match compress_and_write(&path_file, &content) {
+            Ok(content) => match write_data(storage.db(), &block.key(), &content) {
                 Ok(_) => {
-                    println!("📦 Fetched block {}", block_number);
+                    log::info!("📦 Fetched block {}", block.0);
+                    storage.set_max_block_sync(block);
+                    block = block.next();
                 }
                 Err(e) => {
-                    eprintln!("❌ Error writing to file {}: {}", &path_file.display(), e);
-                    continue;
+                    return format!("❌ Error writing to DB {}: {}", &block.key(), e);
                 }
             },
             Err(e) => {
-                eprintln!("❌ Error fetching block {}: {}", block_number, e);
+                log::error!("❌ Error fetching block {}: {}", block.0, e);
+                tokio::time::sleep(tokio::time::Duration::from_secs(5)).await
             }
         }
     }
-    format!("Synched block {} to {}", start, end)
+
+    format!("Synched block {} to {}", start.0, block.0)
 }
 
-async fn sync_state_update(start: u64, end: u64, running: Arc<AtomicBool>) -> String {
+async fn sync_state_update(
+    end: u64,
+    running: Arc<AtomicBool>,
+    storage: Arc<Storage>,
+    feeder: String,
+) -> String {
     let client = Client::new();
 
-    for block_number in start..=end {
-        // Check if a graceful shutdown was requested
-        if running.load(Ordering::SeqCst) == false {
-            return format!(
-                "Synched state update from block {} to {}",
-                start,
-                block_number - 1
-            );
-        }
-        let path_file = PathBuf::from(format!(
-            "{}/{}.gz",
-            DB_PATH,
-            RequestType::StateUpdate(block_number).path()
-        ));
-        if path_file.exists() {
-            continue;
+    let start = match storage.max_state_sync() {
+        Some(state) => state.next(),
+        None => State(0),
+    };
+
+    if start.0 > end {
+        return "No state update to sync".to_string();
+    }
+
+    let mut state = start;
+    loop {
+        // Check if a graceful shutdown was requested or sync is finished
+        if !running.load(Ordering::SeqCst) || state.0 > end {
+            break;
         }
 
         let url = format!(
             "{}/feeder_gateway/get_state_update?blockNumber={}",
-            FEEDER_GATEWAY_URL, block_number
+            feeder, state.0
         );
         match fetch_data(&client, &url).await {
-            Ok(content) => match compress_and_write(&path_file, &content) {
+            Ok(content) => match write_data(storage.db(), &state.key(), &content) {
                 Ok(_) => {
-                    println!("🗳️  Fetched state update block {}", block_number);
+                    log::info!("📦 Fetched state update {}", state.0);
+                    storage.set_max_state_sync(state);
+                    state = state.next();
                 }
                 Err(e) => {
-                    eprintln!("❌ Error writing to file {}: {}", &path_file.display(), e);
+                    return format!("❌ Error writing to DB {}: {}", &state.key(), e);
+                }
+            },
+            Err(e) => {
+                log::error!("❌ Error fetching state update {}: {}", state.0, e);
+                tokio::time::sleep(tokio::time::Duration::from_secs(5)).await
+            }
+        }
+    }
+
+    format!("Synched state update {} to {}", start.0, state.0)
+}
+
+async fn sync_class(
+    start: u64,
+    end: u64,
+    running: Arc<AtomicBool>,
+    storage: Arc<Storage>,
+    feeder: String,
+) -> String {
+    let client = Client::new();
+
+    let mut state = State(start);
+    loop {
+        // Check if a graceful shutdown was requested
+        if !running.load(Ordering::SeqCst) || state.0 > end {
+            break;
+        }
+
+        let state_update = match read_data(storage.db(), &state.key()) {
+            Ok(state_update) => match state_update {
+                Some(state_update) => state_update,
+                None => {
+                    log::info!("💾 State update {} not found, 💤 waiting 5 sec", state);
+                    tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
                     continue;
                 }
             },
             Err(e) => {
-                eprintln!(
-                    "❌ Error fetching state update block {}: {}",
-                    block_number, e
-                );
+                log::error!("❌ Error reading state update {}: {}", state, e);
+                tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+                continue;
             }
-        }
-    }
-    format!("Synched state update {} to {}", start, end)
-}
+        };
 
-#[derive(Deserialize)]
-struct StateUpdate {
-    state_diff: StateDiff,
-}
-
-#[derive(Deserialize)]
-struct StateDiff {
-    deployed_contracts: Vec<Contract>,
-    declared_classes: Vec<Class>,
-}
-
-#[derive(Deserialize)]
-struct Contract {
-    class_hash: String,
-}
-
-#[derive(Deserialize)]
-struct Class {
-    class_hash: String,
-}
-
-async fn sync_class(start: u64, end: u64, running: Arc<AtomicBool>) -> String {
-    let client = Client::new();
-
-    for block_number in start..=end {
-        // Check if a graceful shutdown was requested
-        if !running.load(Ordering::SeqCst) {
-            return format!("Synched class from block {} to {}", start, block_number - 1);
-        }
-
-        let path_state_update = PathBuf::from(format!(
-            "{}/{}.gz",
-            DB_PATH,
-            RequestType::StateUpdate(block_number).path()
-        ));
-
-        // Check if state update was fetched, if not, skip
-        if path_state_update.exists() == false {
-            continue;
-        }
-
-        let state_update = match read_and_decompress(&path_state_update) {
-            Ok(state_update) => state_update,
+        let class_hashes = match extract_class_hash(&state_update) {
+            Ok(class_hashes) => class_hashes,
             Err(e) => {
-                eprintln!(
-                    "❌ Error reading file {}: {}",
-                    &path_state_update.display(),
+                log::error!(
+                    "❌ Error extracting class hashes from state update {}: {}",
+                    state,
                     e
                 );
                 continue;
             }
         };
 
-        let json_state_update: StateUpdate = match serde_json::from_str(&state_update) {
-            Ok(json_state_update) => json_state_update,
-            Err(e) => {
-                eprintln!("❌ Error parsing JSON: {}", e);
-                continue;
-            }
-        };
-
-        let class_hashes = extract_class_hash(&json_state_update.state_diff);
+        state = state.next();
 
         for hash in class_hashes {
-            let path_file = PathBuf::from(format!("{}/class_{}.gz", DB_PATH, hash));
-            if path_file.exists() {
+            let class = Class(hash.to_string());
+            if is_key_present(storage.db(), &class.key()) {
                 continue;
             }
             let url = format!(
                 "{}/feeder_gateway/get_class_by_hash?classHash={}",
-                FEEDER_GATEWAY_URL, hash
+                feeder, hash
             );
             match fetch_data(&client, &url).await {
-                Ok(content) => match compress_and_write(&path_file, &content) {
+                Ok(content) => match write_data(storage.db(), &class.key(), &content) {
                     Ok(_) => {
-                        println!("📦 Fetched class {}", hash);
+                        log::info!("📦 Fetched class {}", hash);
                     }
                     Err(e) => {
-                        eprintln!("❌ Error writing to file {}: {}", &path_file.display(), e);
+                        log::error!("❌ Error writing to DB {}: {}", &class.key(), e);
                     }
                 },
                 Err(e) => {
-                    eprintln!("❌ Error fetching class {}: {}", hash, e);
+                    log::error!("❌ Error fetching class {}: {}", hash, e);
                 }
             }
         }
@@ -291,230 +317,79 @@ async fn sync_class(start: u64, end: u64, running: Arc<AtomicBool>) -> String {
     format!("Synched class from block {} to {}", start, end)
 }
 
-fn extract_class_hash(state_diff: &StateDiff) -> Vec<&String> {
-    let mut class_hashes = vec![];
+async fn index(storage: web::Data<Arc<Storage>>) -> impl Responder {
+    log::info!("🔗 Request received");
+    let max_block_sync = storage.max_block_sync().unwrap_or(Block(0));
+    let max_state_sync = storage.max_state_sync().unwrap_or(State(0));
 
-    state_diff.deployed_contracts.iter().for_each(|contract| {
-        class_hashes.push(&contract.class_hash);
-    });
-    state_diff.declared_classes.iter().for_each(|class| {
-        class_hashes.push(&class.class_hash);
-    });
-
-    class_hashes
-}
-enum RequestType {
-    Block(u64),
-    StateUpdate(u64),
-    Class(String),
-    Other(String),
+    format!(
+        "Max block to sync: {}, max state to sync: {}\n",
+        max_block_sync, max_state_sync
+    )
 }
 
-impl RequestType {
-    fn path(&self) -> String {
-        match self {
-            RequestType::Block(id) => format!("block_{}", id),
-            RequestType::StateUpdate(id) => format!("state_update_{}", id),
-            RequestType::Class(hash) => format!("class_{}", hash),
-            RequestType::Other(uri) => uri.to_string(),
-        }
-    }
-
-    fn uri(&self) -> String {
-        match self {
-            RequestType::Block(id) => format!("get_block?blockNumber={}", id),
-            RequestType::StateUpdate(id) => format!("get_state_update?blockNumber={}", id),
-            RequestType::Class(hash) => format!("get_class_by_hash?classHash={}", hash),
-            RequestType::Other(uri) => uri.to_string(),
-        }
-    }
-
-    fn from_uri(uri: &str) -> Result<RequestType, &'static str> {
-        match uri {
-            uri if uri.starts_with("/feeder_gateway/get_block?blockNumber=") => {
-                let block_number = block_number_from_path(&uri)?;
-                match block_number {
-                    block_number if block_number <= MAX_BLOCK_TO_SYNC => {
-                        Ok(RequestType::Block(block_number))
-                    }
-                    _ => Ok(RequestType::Other(uri.to_string())),
-                }
-            }
-            uri if uri.starts_with("/feeder_gateway/get_state_update?blockNumber=") => {
-                let block_number = block_number_from_path(&uri)?;
-                match block_number {
-                    block_number if block_number <= MAX_BLOCK_TO_SYNC => {
-                        Ok(RequestType::StateUpdate(block_number))
-                    }
-                    _ => Ok(RequestType::Other(uri.to_string())),
-                }
-            }
-            uri if uri.starts_with("/feeder_gateway/get_class_by_hash?classHash=") => {
-                let class_hash = class_hash_from_path(&uri)?;
-                Ok(RequestType::Class(class_hash))
-            }
-            _ => Ok(RequestType::Other(uri.to_string())),
-        }
-    }
+#[derive(Deserialize)]
+struct BlockNumber {
+    block_number: u64,
 }
 
-impl std::fmt::Display for RequestType {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            RequestType::Block(id) => write!(f, "block {}", id),
-            RequestType::StateUpdate(id) => write!(f, "state update {}", id),
-            RequestType::Class(hash) => write!(f, "class {}", hash),
-            RequestType::Other(uri) => write!(f, "other: {}", uri),
-        }
-    }
-}
-
-async fn handle_request(req: Request<Body>) -> anyhow::Result<Response<Body>> {
-    tokio::time::sleep(tokio::time::Duration::from_millis(5000)).await;
-    let begin_time = std::time::Instant::now();
-    let uri = req.uri().to_string();
-
-    // Check if URI is valid
-    let request_type = match RequestType::from_uri(&uri) {
-        Ok(request_type) => request_type,
+async fn get_block(
+    storage: web::Data<Arc<Storage>>,
+    web::Query(block_number): web::Query<BlockNumber>,
+) -> impl Responder {
+    let block = Block(block_number.block_number);
+    match read_data(storage.db(), &block.key()) {
+        Ok(block) => match block {
+            Some(block) => HttpResponse::Ok().body(block),
+            None => HttpResponse::NotFound().body("Block not found"),
+        },
         Err(e) => {
-            eprintln!("❌ Error parsing URI: {}", e);
-            return Ok(Response::new(Body::from("Error parsing URI")));
-        }
-    };
-
-    match request_type {
-        RequestType::Block(_) | RequestType::StateUpdate(_) | RequestType::Class(_) => {
-            let cache_path = PathBuf::from(format!("{}/{}.gz", DB_PATH, request_type.path()));
-
-            // Check if response is in cache
-            if cache_path.exists() {
-                // Serve from cache
-                match read_and_decompress(&cache_path) {
-                    Ok(content) => {
-                        let size = content.len();
-                        let ret = Response::new(Body::from(content));
-                        let elapsed_time = begin_time.elapsed();
-                        println!(
-                            "📤 Serving from cache, {} ({} Ko, {} µs)",
-                            request_type,
-                            size / 1024,
-                            elapsed_time.as_micros()
-                        );
-                        return Ok(ret);
-                    }
-                    Err(e) => {
-                        eprintln!("❌ Error reading file {}: {}", &cache_path.display(), e);
-                        match fs::remove_file(&cache_path) {
-                            Ok(_) => {
-                                println!("🗑️ Removed file {}", &cache_path.display());
-                            }
-                            Err(e) => {
-                                eprintln!(
-                                    "❌ Error removing file {}: {}",
-                                    &cache_path.display(),
-                                    e
-                                );
-                            }
-                        }
-                        return Ok(Response::new(Body::from("Error from cache")));
-                    }
-                }
-            } else {
-                // Fetch from external API and store in cache
-                let client = reqwest::Client::new();
-                let external_url = format!(
-                    "{}/feeder_gateway/{}",
-                    FEEDER_GATEWAY_URL,
-                    request_type.uri()
-                );
-                match fetch_data(&client, &external_url).await {
-                    Ok(content) => {
-                        let size = content.len();
-                        let ret = Ok(Response::new(Body::from(content.clone())));
-                        let elapsed_time = begin_time.elapsed();
-                        println!(
-                            "📤 Serving from external API, {} ({} Ko, {} µs)",
-                            request_type,
-                            size / 1024,
-                            elapsed_time.as_micros()
-                        );
-                        match compress_and_write(&cache_path, &content) {
-                            Ok(_) => {
-                                println!("📦 Fetched {} and stored in cache", request_type);
-                                return ret;
-                            }
-                            Err(e) => {
-                                eprintln!(
-                                    "❌ Error writing to file {}: {}",
-                                    &cache_path.display(),
-                                    e
-                                );
-                                return ret;
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        eprintln!("❌ Error fetching {}: {}", request_type.path(), e);
-                        return Ok(Response::new(Body::from(
-                            "Error fetching from external API",
-                        )));
-                    }
-                }
-            }
-        }
-        // unmatched uri
-        RequestType::Other(uri) => {
-            println!("❓ Unmatched URI: {}", uri);
-            let client = reqwest::Client::new();
-            let external_url = format!("{}{}", FEEDER_GATEWAY_URL, uri);
-            match fetch_data(&client, &external_url).await {
-                Ok(content) => {
-                    let size = content.len();
-                    let ret = Response::new(Body::from(content));
-                    let elapsed_time = begin_time.elapsed();
-                    println!(
-                        "📤 Serving from external API, {} ({} Ko, {} µs)",
-                        uri,
-                        size / 1024,
-                        elapsed_time.as_micros()
-                    );
-                    return Ok(ret);
-                }
-                Err(e) => {
-                    eprintln!("❌ Error fetching {}: {}", uri, e);
-                    return Ok(Response::new(Body::from(
-                        "Error fetching from external API",
-                    )));
-                }
-            }
+            log::error!("❌ Error reading block {}: {}", block, e);
+            HttpResponse::InternalServerError().body("Error reading block")
         }
     }
 }
 
-fn block_number_from_path(path: &str) -> Result<u64, &'static str> {
-    match Url::parse(format!("http://localhost:3000/{}" ,path).as_str()) {
-        Ok(url) => for (key, value) in url.query_pairs() {
-            if key == "blockNumber" {
-                match value.parse() {
-                    Ok(block_number) => return Ok(block_number),
-                    Err(_) => return Err("Invalid block number"),
-                }
-            }
-        }
-        Err(_) => return Err("Invalid URL"),
-    };
-    Err("Invalid block number")
+#[derive(Deserialize)]
+struct StateUpdate {
+    block_number: u64,
 }
 
-fn class_hash_from_path(path: &str) -> Result<String, &'static str> {
-    match Url::parse(format!("http://localhost:3000/{}" ,path).as_str()) {
-        Ok(url) => for (key, value) in url.query_pairs() {
-            if key == "classHash" {
-                return Ok(value.to_string());
-            }
+async fn get_state_update(
+    storage: web::Data<Arc<Storage>>,
+    web::Query(state_update): web::Query<StateUpdate>,
+) -> impl Responder {
+    let state = State(state_update.block_number);
+    match read_data(storage.db(), &state.key()) {
+        Ok(state) => match state {
+            Some(state) => HttpResponse::Ok().body(state),
+            None => HttpResponse::NotFound().body("State update not found"),
+        },
+        Err(e) => {
+            log::error!("❌ Error reading state update {}: {}", state, e);
+            HttpResponse::InternalServerError().body("Error reading state update")
         }
-        Err(_) => return Err("Invalid URL"),
-    };
-    Err("Invalid class hash")
+    }
+}
+
+#[derive(Deserialize)]
+struct ClassHash {
+    class_hash: String,
+}
+
+async fn get_class_by_hash(
+    storage: web::Data<Arc<Storage>>,
+    web::Query(class_hash): web::Query<ClassHash>,
+) -> impl Responder {
+    let class = Class(class_hash.class_hash);
+    match read_data(storage.db(), &class.key()) {
+        Ok(class) => match class {
+            Some(class) => HttpResponse::Ok().body(class),
+            None => HttpResponse::NotFound().body("Class not found"),
+        },
+        Err(e) => {
+            log::error!("❌ Error reading class {}: {}", class, e);
+            HttpResponse::InternalServerError().body("Error reading class")
+        }
+    }
 }
