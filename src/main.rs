@@ -330,14 +330,15 @@ async fn index(storage: web::Data<Arc<Storage>>) -> impl Responder {
 
 #[derive(Deserialize)]
 struct BlockNumber {
-    block_number: u64,
+    //blockNumber
+    blockNumber: u64,
 }
 
 async fn get_block(
     storage: web::Data<Arc<Storage>>,
     web::Query(block_number): web::Query<BlockNumber>,
 ) -> impl Responder {
-    let block = Block(block_number.block_number);
+    let block = Block(block_number.blockNumber);
     match read_data(storage.db(), &block.key()) {
         Ok(block) => match block {
             Some(block) => HttpResponse::Ok().body(block),
@@ -350,16 +351,11 @@ async fn get_block(
     }
 }
 
-#[derive(Deserialize)]
-struct StateUpdate {
-    block_number: u64,
-}
-
 async fn get_state_update(
     storage: web::Data<Arc<Storage>>,
-    web::Query(state_update): web::Query<StateUpdate>,
+    web::Query(block_number): web::Query<BlockNumber>,
 ) -> impl Responder {
-    let state = State(state_update.block_number);
+    let state = State(block_number.blockNumber);
     match read_data(storage.db(), &state.key()) {
         Ok(state) => match state {
             Some(state) => HttpResponse::Ok().body(state),
@@ -372,16 +368,17 @@ async fn get_state_update(
     }
 }
 
+// url ...classHash=...
 #[derive(Deserialize)]
 struct ClassHash {
-    class_hash: String,
+    classHash: String,
 }
 
 async fn get_class_by_hash(
     storage: web::Data<Arc<Storage>>,
     web::Query(class_hash): web::Query<ClassHash>,
 ) -> impl Responder {
-    let class = Class(class_hash.class_hash);
+    let class = Class(class_hash.classHash);
     match read_data(storage.db(), &class.key()) {
         Ok(class) => match class {
             Some(class) => HttpResponse::Ok().body(class),
